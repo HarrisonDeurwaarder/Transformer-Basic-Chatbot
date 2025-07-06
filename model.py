@@ -2,47 +2,50 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from transformers import AutoTokenizer
 from utils import *
 
 
-class PositionalEncoding(nn.Module):
+# ---------------------------
+# FEEDFORWARD NETWORK
+# ---------------------------
+
+class FeedForward(nn.Module):
     '''
-    Encodes position into the embeddings, which are not naturally in postion-agnostic transformers
+    2-layer feedforward neural network sublayer, applied to each token
     '''
     def __init__(self, 
-                 max_length: int, 
-                 d_embedding: int,) -> None:
+                 d_embedding: int, 
+                 intermed_scale: int = 4,) -> None:
         '''
-        Initializes an instance of PositionalEncoding
+        Initializes an instance of FeedForward
         
         Params:
-        max-length is the largest sequence length to be handled
         d_embedding is the embedding dimensions for each token
+        intermed_scale is the scale between the hidden and visible layer
         '''
         super().__init__()
-        self.pe = torch.zeros(max_length, d_embedding)
-        
-        pos = torch.arange(0, max_length).unsqueeze(1)
-        emb = torch.arange(0, d_embedding, 2).unsqueeze(0)
-        inner_term = pos / torch.pow(10000, emb / d_embedding)
-        
-        # Apply alternating sin/cos to quotient
-        self.pe[:, 0::2] = torch.sin(inner_term)
-        self.pe[:, 1::2] = torch.cos(inner_term)
+        self.net = nn.Sequential(
+            nn.Linear(d_embedding, d_embedding * intermed_scale),
+            nn.ReLU(),
+            nn.Linear(d_embedding * intermed_scale, d_embedding)
+        )
     
     def forward(self, 
-                x: torch.Tensor, 
-                length: int,) -> torch.Tensor:
+                x: torch.Tensor,) -> torch.Tensor:
         '''
-        Applies pre-calculated positional encodings to X
-        
-        Params:
-        X is the unaltered input embeddings [length, embedding-dim]
+        Pass X through dense sublayer
+        X is the post-attention embeddings of shape [length, embedding_dim]
         '''
-        return x + self.pe[:length]
+        return self.net(x)
 
 
-class MultiHeadAttention(nn.Module):
+# ---------------------------
+# ATTENTION MECHANISMS
+# ---------------------------
+
+
+class SelfAttention(nn.Module):
     '''
     Applies scaled dot-product attention to input using learned keys, queries, and values
     '''
@@ -50,14 +53,14 @@ class MultiHeadAttention(nn.Module):
                  d_embedding: int, 
                  n_heads: int,) -> None:
         '''
-        Initializes an instance of MultiHeadAttention
+        Initializes an instance of SelfAttention
         
         Params:
         d_embedding is the embedding dimensions for each token
         n_heads is the number of attention heads, which are concatenated after computation
         '''
         super().__init__()
-        assert d_embedding % n_heads == 0
+        assert d_embedding % n_heads == 0, 'd_embedding is not divisible by n_heads'
         
         # Clone weights from identical distribution
         weight = lambda: nn.Parameter(
@@ -75,7 +78,9 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_embedding // n_heads
     
-    def forward(self, x: torch.Tensor, in_decoder: bool = False) -> torch.Tensor:
+    def forward(self, 
+                x: torch.Tensor, 
+                use_mask: bool = False,) -> torch.Tensor:
         '''
         Applies pre-calculated positional encodings to X
         
@@ -84,84 +89,18 @@ class MultiHeadAttention(nn.Module):
         in_decoder indicates whether or not to use causal masking to hide future tokens
         '''
         # Apply an optional (decoder-only causal mask to hide future tokens)
-        mask = self.causal_mask(x.size(0)) if in_decoder else 0
+        mask = self.causal_mask(x.size(0)) if use_mask else 0
         
         # Using tuned qkv weights, derive the Q/K/V matrices (shape: [n_heads, length, d_k])
         Q = (x @ self.query.transpose(-2, -1)).view(-1, self.n_heads, self.d_k).transpose(0, 1)
         K = (x @ self.key.transpose(-2, -1)).view(-1, self.n_heads, self.d_k).transpose(0, 1)
         V = (x @ self.value.transpose(-2, -1)).view(-1, self.n_heads, self.d_k).transpose(0, 1)
-        
         qk_dot = (Q @ K.transpose(-2, -1)) / np.sqrt(self.d_k) # shape: [n_heads, length, length]
-        valued_weights = torch.softmax(qk_dot + mask, dim=-1) @ V.transpose(-2, -1) # shape: [n_heads, length, d_k]
+        valued_weights = torch.softmax(qk_dot + mask, dim=-1) @ V # shape: [n_heads, length, d_k]
         concat_heads = valued_weights.transpose(0, 1).contiguous().view(-1, self.d_embedding) # shape: [length, embedding_dim]
         
         # Linear projection applied to concatenated heads
         return concat_heads @ self.out_proj.transpose(-2, -1) # shape: [length, embedding_dim]
-
-
-class ResidualConnection(nn.Module):
-    '''
-    Adds a normalized embedding vector to every token
-    '''
-    def __init__(self,
-                 d_embedding: int,) -> None:
-        '''
-        Initializes an instance of ResidualConnection
-        
-        Params:
-        d_embedding is the embedding dimensions for each token
-        '''
-        super().__init__()
-        # Scale and shift
-        self.gamma = nn.Parameter(torch.ones(d_embedding))
-        self.beta = nn.Parameter(torch.zeros(d_embedding))
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        '''
-        Adds the normalized vector
-        
-        Params:
-        X is the post-attention or post-ffn embeddings of shape [length, embedding-dim]
-        '''
-        epsilon = 1e-5
-        mean = torch.mean(x, dim=-1).unsqueeze(1)
-        # Variance = std^2
-        var = torch.mean(torch.square(x - mean))
-        # Epsilon term prevents div-by-zero
-        std = torch.sqrt(var + epsilon)
-        
-        norm = (x - mean) / std
-        # Learnable weight/bias are applied
-        return self.gamma * norm + self.beta
-
-
-class FeedForward(nn.Module):
-    '''
-    2-layer feedforward neural network sublayer, applied to each token
-    '''
-    def __init__(self, 
-                 d_embedding: int, 
-                 intermed_scale: int = 4,) -> None:
-        '''
-        Initializes an instance of FeedForward
-        
-        Params:
-        d_embedding is the embedding dimensions for each token
-        '''
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_embedding, d_embedding * intermed_scale),
-            nn.ReLU(),
-            nn.Linear(d_embedding * intermed_scale, d_embedding)
-        )
-    
-    def forward(self, 
-                x: torch.Tensor,) -> torch.Tensor:
-        '''
-        Pass X through dense sublayer
-        X is the post-attention embeddings of shape [length, embedding_dim]
-        '''
-        return self.net(x)
 
 
 class CrossAttention(nn.Module):
@@ -181,7 +120,7 @@ class CrossAttention(nn.Module):
         super().__init__()
         assert d_embedding % n_heads == 0
         
-        # Clone weights from identical distribution
+        # Sample weights from identical distribution
         weight = lambda: nn.Parameter(
             torch.empty(d_embedding, d_embedding).uniform_(
                 -np.sqrt(3 / d_embedding), 
@@ -197,7 +136,9 @@ class CrossAttention(nn.Module):
         self.n_heads = n_heads
         self.d_k = d_embedding // n_heads
     
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(self, 
+                x: torch.Tensor, 
+                context: torch.Tensor,) -> torch.Tensor:
         '''
         Applies pre-calculated positional encodings to X
         
@@ -211,60 +152,147 @@ class CrossAttention(nn.Module):
         V = (context @ self.value.transpose(-2, -1)).view(-1, self.n_heads, self.d_k).transpose(0, 1) #shape: [n_heads, enc_length, d_k]
         
         qk_dot = (Q @ K.transpose(-2, -1)) / np.sqrt(self.d_k) # shape: [n_heads, dec_length, enc_length]
-        print(torch.softmax(qk_dot, dim=-1).size(), V.transpose(-2, -1).size())
         valued_weights = torch.softmax(qk_dot, dim=-1) @ V # shape: [n_heads, dec_length, d_k]
         concat_heads = valued_weights.transpose(0, 1).contiguous().view(-1, self.d_embedding) # shape: [dec_length, embedding_dim]
         
         # Linear projection applied to concatenated heads
         return concat_heads @ self.out_proj.transpose(-2, -1) # shape: [length, embedding_dim]
     
+    
+# ---------------------------
+# TRANSFORMER ARCHITECTURE
+# ---------------------------
+    
 
 class Encoder(nn.Module):
-    
-    def __init__(self,) -> None:
+    '''
+    Runs once for a sequence; generates a context-rich vector of the prompt/equivalent
+    '''
+    def __init__(self, 
+                 d_embedding: int,
+                 max_len: int = 128,
+                 n_heads: int = 8,
+                 layers: int = 6,) -> None:
         '''
         Initializes an instance of Encoder
         
         Params:
         d_embedding is the embedding dimensions for each token
+        max_len is the largest sequence length to be handled
+        n_heads is the number of attention heads, which are concatenated after computation
+        layers is the number of repetitions done by the central block
         '''
         super().__init__()
+        self.layers = layers
+        self.d_embedding = d_embedding
+        self.max_len = max_len
+        
+        # Positional encoding
+        self.pe = PositionalEncoding(max_len=max_len, 
+                                     d_embedding=d_embedding,)
+        # Self-attention layer
+        self.att = SelfAttention(d_embedding=d_embedding,
+                                 n_heads=n_heads,)
+        # FFN
+        self.ffn = FeedForward(d_embedding=d_embedding,
+                               intermed_scale=4,)
+        # Residual connections (add/norm)
+        self.res1 = ResidualConnection(d_embedding=d_embedding)
+        self.res2 = ResidualConnection(d_embedding=d_embedding)
     
-    def forward(self,) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,) -> torch.Tensor:
         '''
-        Applies pre-calculated positional encodings to X
+        Generates context vector from prompt X
         
         Params:
-        
+        X is the embedded tokens of shape [length, embedding_dim]
         '''
-        pass
+        x = self.pe(x)
+        # Main encoder block
+        for _ in range(self.layers):
+            x = self.res1(self.att(x, 
+                                   use_mask=False,))
+            x = self.res2(self.ffn(x))
+        return x
     
 
 class Decoder(nn.Module):
-    
-    def __init__(self,
-                 d_embedding,) -> None:
+    '''
+    Runs until <EOS> token is generated; utilizes context-rich encoded vector and previous tokens to generate new tokens
+    '''
+    def __init__(self, 
+                 d_embedding: int,
+                 max_len: int = 64,
+                 vocab_size: int = 30000,
+                 n_heads: int = 8,
+                 layers: int = 6,) -> None:
         '''
         Initializes an instance of Decoder
         
         Params:
         d_embedding is the embedding dimensions for each token
+        max_len is the largest sequence length to be handled
+        vocab_size is the size the list containing possible tokens to generate
+        n_heads is the number of attention heads, which are concatenated after computation
+        layers is the number of repetitions done by the central block
         '''
         super().__init__()
-    
-    def forward(self,) -> torch.Tensor:
+        self.layers = layers
+        self.vocab_size = vocab_size
+        self.d_embedding = d_embedding
+        self.max_len = max_len
+        
+        # Positional encoding
+        self.pe = PositionalEncoding(max_len=max_len, 
+                                     d_embedding=d_embedding,)
+        # Attention layers
+        self.att1 = SelfAttention(d_embedding=d_embedding,
+                                 n_heads=n_heads,)
+        self.att2 = CrossAttention(d_embedding=d_embedding,
+                                 n_heads=n_heads,)
+        # FFN
+        self.ffn = FeedForward(d_embedding=d_embedding,
+                               intermed_scale=4,)
+        # Residual connections (add/norm)
+        self.res1 = ResidualConnection(d_embedding=d_embedding)
+        self.res2 = ResidualConnection(d_embedding=d_embedding)
+        self.res3 = ResidualConnection(d_embedding=d_embedding)
+        # Final transformation
+        self.lin = nn.Linear(d_embedding, vocab_size)
+
+    def forward(self,
+                x: torch.Tensor,
+                context: torch.Tensor,
+                temperature: float = 1.0) -> torch.Tensor:
         '''
-        Applies pre-calculated positional encodings to X
+        Generates a single tokens using X and encoder context
         
         Params:
-        
+        X is the previously-generated embedded tokens beginning with <BOS> of shape [length, embedding_dim]
+        context is the context-rich embeddings from the encoder to be attended of shape [enc_length, embedding_dim]
+        temperature < 0 scales the "unpredictability" of the output, where T > 1 produces less predictable tokens, and T < 1 produces more predictable tokens
         '''
-        pass
+        x = self.pe(x)
+        # Main decoder block
+        for _ in range(self.layers):
+            x = self.res1(self.att1(x, 
+                                    use_mask=True,))
+            x = self.res2(self.att2(x, 
+                                    context=context,))
+            x = self.res3(self.ffn(x))
+        # Projection to probability distribution
+        x = self.lin(x) / temperature
+        return torch.multinomial(torch.softmax(x, dim=1)[-1], num_samples=1)
     
 
 class Transformer(nn.Module):
-    
-    def __init__(self,) -> None:
+    '''
+    A transformer neural network, encodes a prompt and autoregressively generates tokens using attention until <EOS> is reached
+    '''
+    def __init__(self,
+                 encoder: Encoder,
+                 decoder: Decoder,) -> None:
         '''
         Initializes an instance of Transformer
         
@@ -272,12 +300,57 @@ class Transformer(nn.Module):
         d_embedding is the embedding dimensions for each token
         '''
         super().__init__()
+        # Extract embedding dimensions and vocab size from enc/dec
+        assert encoder.d_embedding == decoder.d_embedding
+        self.d_embedding = encoder.d_embedding
+        self.vocab_size = decoder.vocab_size
+        
+        self.enc = encoder
+        self.dec = decoder
+        self.tokenizer = AutoTokenizer.from_pretrained('facebook/bart-base')
+        self.embedding = nn.Embedding(num_embeddings=self.vocab_size, embedding_dim=self.d_embedding)
     
-    def forward(self,) -> torch.Tensor:
+    def embed(self,
+              tokens: torch.Tensor,) -> torch.Tensor:
         '''
-        Applies pre-calculated positional encodings to X
+        Turns a tokenized string (ids) into an embedding matrix of shape [length, embedding_dim]
         
         Params:
-        
+        tokens is the id-tensor input to the transformer of shape [length, vocab_size]
         '''
-        pass
+        # Get embedding vectors
+        return self.embedding(tokens).squeeze(0)
+    
+    @timer
+    def forward(self,
+                x: str,
+                inference: bool = True) -> torch.Tensor:
+        '''
+        Passes string-prompt X through the transformer
+        
+        Params:
+        X is a string containing the prompt
+        '''
+        # Tokenize
+        tokens = self.tokenizer(x.lower(), max_length=self.enc.max_len, return_tensors='pt', truncation=True, padding=True)
+        # Get context vector from encoder
+        x = self.embed(tokens=tokens['input_ids'])
+        context = self.enc(x)
+        
+        # ids are converted to a string, embedded_ids are fed back into the model
+        ids = torch.Tensor([0]).int()
+        embedded_ids = self.embed(ids)
+        
+        print('Benchmark #2')
+        # Autoregressively run the decoder until an EOS is produced (id=2)
+        while self.tokenizer.decode(ids[-1]) != 2 and ids.size(0) < self.dec.max_len:
+            # Reevaluate embeddings
+            embedded_ids = self.embed(ids)
+            ids = torch.cat([ids, self.dec(embedded_ids, context=context)])
+            #print(self.tokenizer.decode(ids))
+            
+        # Convert ids to string for easy inference, else return raw ids
+        if inference:
+            return self.tokenizer.decode(ids)
+        
+        return ids
