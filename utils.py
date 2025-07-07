@@ -59,10 +59,10 @@ class PositionalEncoding(nn.Module):
         Applies pre-calculated positional encodings to X
         
         Params:
-        X is the unaltered input embeddings [length, embedding-dim]
+        X is the unaltered input embeddings of shape [batch, length, embedding-dim]
         '''
-        assert x.size(0) <= self.max_len, 'Token length exceeds maximum'
-        return x + self.pe[:x.size(0)]
+        assert x.size(-2) <= self.max_len, 'Token length exceeds maximum'
+        return x + self.pe[:x.size(-2)]
 
 
 class ResidualConnection(nn.Module):
@@ -88,7 +88,7 @@ class ResidualConnection(nn.Module):
         Adds the normalized vector
         
         Params:
-        X is the post-attention or post-ffn embeddings of shape [length, embedding-dim]
+        X is the post-attention or post-ffn embeddings of shape [batch, length, embedding_dim]
         '''
         epsilon = 1e-5
         mean = torch.mean(x, dim=-1).unsqueeze(1)
