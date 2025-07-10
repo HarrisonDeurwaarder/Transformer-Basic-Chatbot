@@ -8,11 +8,11 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
 
-BATCH_SIZE = 2
+BATCH_SIZE = 8
 LR = 1e-3
-EMBEDDING_DIM = 8
-ENCODER_LEN = 128
-DECODER_LEN = 64
+EMBEDDING_DIM = 512
+ENCODER_LEN = 1028
+DECODER_LEN = 1028
 VOCAB_SIZE = 50265
 HEADS = 8
 LAYERS = 6
@@ -68,7 +68,7 @@ def main():
             one_hot = nn.functional.one_hot(tokens['input_ids'].to(device), num_classes=VOCAB_SIZE)
             # Get the true softmax probabilities
             out = model(prompts, inference=False)
-            print(out)
+            print(out, 'out')
             # Backpropagate
             loss = criterion(out, one_hot)
             loss.backward()

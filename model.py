@@ -103,12 +103,12 @@ class SelfAttention(nn.Module):
         # Apply an optional (decoder-only causal mask to hide future tokens)
         length = x.size(-2)
         mask = self.causal_mask[:length, :length].to(self.causal_mask.device) if use_mask else 0
-        
         # Using tuned qkv weights, derive the Q/K/V matrices (shape: [batch, n_heads, length, d_k])
-        Q = (x @ self.query.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1)
-        K = (x @ self.key.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1)
-        V = (x @ self.value.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1)
+        Q = (x @ self.query.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1)
+        K = (x @ self.key.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1)
+        V = (x @ self.value.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1)
         qk_dot = (Q @ K.transpose(-2, -1)) / np.sqrt(self.d_k) # shape: [batch, n_heads, length, length]
+        print(qk_dot.shape, Q.shape, K.shape, V.shape)
         valued_weights = torch.softmax(qk_dot + mask, dim=-1) @ V # shape: [batch, n_heads, length, d_k]
         concat_heads = valued_weights.transpose(-2, -1).contiguous().view(-1, length, self.d_embedding) # shape: [batch, length, embedding_dim]
         
@@ -162,9 +162,9 @@ class CrossAttention(nn.Module):
         length = x.size(-2)
         
         # Using tuned qkv weights, derive the Q/K/V matrices
-        Q = (x @ self.query.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1) # shape: [batch, n_heads, dec_length, d_k]
-        K = (context @ self.key.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1) # shape: [batch, n_heads, enc_length, d_k]
-        V = (context @ self.value.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1) #shape: [batch, n_heads, enc_length, d_k]
+        Q = (x @ self.query.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1) # shape: [batch, n_heads, dec_length, d_k]
+        K = (context @ self.key.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1) # shape: [batch, n_heads, enc_length, d_k]
+        V = (context @ self.value.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1) #shape: [batch, n_heads, enc_length, d_k]
         
         qk_dot = (Q @ K.transpose(-2, -1)) / np.sqrt(self.d_k) # shape: [batch, n_heads, dec_length, enc_length]
         valued_weights = torch.softmax(qk_dot, dim=-1) @ V # shape: [batch, n_heads, dec_length, d_k]
@@ -241,8 +241,7 @@ class Encoder(nn.Module):
         x = self.pe(x)
         # Main encoder block
         for _ in range(self.layers):
-            x = self.res1(self.att(x, 
-                                   use_mask=False,))
+            x = self.res1(self.att(x, use_mask=False,))
             x = self.res2(self.ffn(x))
         return x
     
@@ -321,6 +320,7 @@ class Decoder(nn.Module):
         context is the context-rich embeddings from the encoder to be attended of shape [batch, enc_length, embedding_dim]
         temperature < 0 scales the "unpredictability" of the output, where T > 1 produces less predictable tokens, and T < 1 produces more predictable tokens
         '''
+        print('1')
         x = self.pe(x)
         # Main decoder block
         for _ in range(self.layers):

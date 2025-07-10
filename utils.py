@@ -102,7 +102,7 @@ class ResidualConnection(nn.Module):
         X is the post-attention or post-ffn embeddings of shape [batch, length, embedding_dim]
         '''
         epsilon = 1e-5
-        mean = torch.mean(x, dim=-1).unsqueeze(1)
+        mean = torch.mean(x, dim=-1)
         # Variance = std^2
         var = torch.mean(torch.square(x - mean.unsqueeze(-1)))
         # Epsilon term prevents div-by-zero
