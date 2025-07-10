@@ -394,7 +394,7 @@ class Transformer(nn.Module):
         '''
         self.device = device
         self.to(device)
-        self.embedding.to(device)
+        self.embedding = self.embedding.to(device)
         self.enc.change_device(device)
         self.dec.change_device(device)
     
@@ -426,10 +426,12 @@ class Transformer(nn.Module):
         tokens = self.tokenizer(x, max_length=self.enc.max_len, return_tensors='pt', truncation=True, padding=True)
         # Get context vector from encoder
         x = self.embed(tokens=tokens['input_ids'].to(self.device))
+        print(x.shape)
         context = self.enc(x)
+        print(context.shape)
         
         # ids are converted to a string, embedded_ids are fed back into the model
-        ids = torch.Tensor(torch.zeros(x.size(0)) if x.size(0) > 1 else [0]).int() # Handle batches vs. single-prompt inference
+        ids = torch.Tensor(torch.zeros(x.size(0)) if x.size(0) > 1 else [0]).int().to(self.device) # Handle batches vs. single-prompt inference
         embedded_ids = self.embed(ids)
         probs = torch.Tensor()
         

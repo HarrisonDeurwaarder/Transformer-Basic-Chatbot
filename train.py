@@ -8,9 +8,9 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
 
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 LR = 1e-3
-EMBEDDING_DIM = 256
+EMBEDDING_DIM = 8
 ENCODER_LEN = 128
 DECODER_LEN = 64
 VOCAB_SIZE = 50265
