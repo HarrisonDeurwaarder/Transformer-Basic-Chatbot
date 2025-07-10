@@ -5,17 +5,19 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+import pandas as pd
 
 
-BATCH_SIZE = 8
+BATCH_SIZE = 1
 LR = 1e-3
-EMBEDDING_DIM = 512
+EMBEDDING_DIM = 256
 ENCODER_LEN = 128
 DECODER_LEN = 64
-VOCAB_SIZE = 30000
+VOCAB_SIZE = 50265
 HEADS = 8
 LAYERS = 6
 EPOCHS = 5
+dataset = 'OpenAssistant/oasst1'
 
 
 class StringDataset(Dataset):
@@ -23,51 +25,55 @@ class StringDataset(Dataset):
     Contains all prompts and responses
     '''
     def __init__(self, data: dict) -> None:
-        self.data = data
+        df = pd.DataFrame(data)
+        self.prompts = df.loc[df['role'] == 'prompter']['text'].reset_index(drop=True)
+        self.responses = df.loc[df['role'] == 'assistant']['text'].reset_index(drop=True)
         
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.prompts)
     
     def __getitem__(self, idx: int) -> str:
-        return self.data[idx]
+        return self.prompts[idx], self.responses[idx]
 
 
 def main():
     # Load data
-    train = load_dataset('blended_skill_talk', split='train')
-    test = load_dataset('blended_skill_talk', split='test')
+    train = load_dataset(dataset, split='train')
+    test = load_dataset(dataset, split='validation')
     
-    train = DataLoader(StringDataset(data={'prompt': train['context'][-1], 
-                                        'response': train['response']}),
+    train = DataLoader(StringDataset(data=train),
                                batch_size=BATCH_SIZE,
                                shuffle=True,)
-    test = StringDataset(data={'prompt': test['context'][-1], 
-                                       'response': test['response']})
+    test = StringDataset(data=test)
+    print('Data loaded')
     
-    model = Transformer(encoder=Encoder(d_embedding=EMBEDDING_DIM,
-                                        max_len=ENCODER_LEN,
-                                        n_heads=HEADS,
-                                        layers=LAYERS,),
-                        decoder=Decoder(d_embedding=EMBEDDING_DIM,
-                                        max_len=DECODER_LEN,
-                                        vocab_size=VOCAB_SIZE,
-                                        n_heads=HEADS,
-                                        layers=LAYERS,))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = Transformer(device=device,
+                        d_embedding=EMBEDDING_DIM,
+                        encoder_max_len=ENCODER_LEN,
+                        decoder_max_len=DECODER_LEN,
+                        n_heads=HEADS,
+                        layers=LAYERS,)
+    
     # Train model
     op = optim.AdamW(params=model.parameters())
     criterion = nn.CrossEntropyLoss()
     
+    print(f'Training started on {device}')
+    
     for _ in range(EPOCHS):
-        for batch in train:
+        for prompts, responses in train:
             # Onehot the expected string (softmax probabilities of 1.0)
-            tokens = model.tokenizer(batch['response'], max_length=DECODER_LEN, return_tensors='pt', truncation=True, padding=True)
-            one_hot = nn.functional.one_hot(tokens, num_classes=VOCAB_SIZE)
+            tokens = model.tokenizer(responses, max_length=DECODER_LEN, return_tensors='pt', truncation=True, padding=True)
+            one_hot = nn.functional.one_hot(tokens['input_ids'].to(device), num_classes=VOCAB_SIZE)
             # Get the true softmax probabilities
-            out = model(batch['prompt'], inference=False)
+            out = model(prompts, inference=False)
+            print(out)
             # Backpropagate
             loss = criterion(out, one_hot)
             loss.backward()
             op.step()
+        print('epoch completed')
     
     print(model('hello model'))
     torch.save(model, 'model.pth')

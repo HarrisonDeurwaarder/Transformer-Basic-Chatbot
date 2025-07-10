@@ -24,7 +24,7 @@ def info(tokenizer) -> None:
     Params:
     tokenizer is the tokenizing model from transformers.AutoTokenizer
     '''
-    print(f'---\n{tokenizer.name_or_path}\nCLS: {tokenizer.cls_token}\nSEP: {tokenizer.sep_token}\nBOS: {tokenizer.bos_token}\nEOS: {tokenizer.eos_token}\n---')
+    print(f'---\n{tokenizer.name_or_path}\nCLS: {tokenizer.cls_token}\nSEP: {tokenizer.sep_token}\nBOS: {tokenizer.bos_token}\nEOS: {tokenizer.eos_token}\nVocab Size: {tokenizer.vocab_size}\n---')
 
 
 class PositionalEncoding(nn.Module):
@@ -52,6 +52,17 @@ class PositionalEncoding(nn.Module):
         # Apply alternating sin/cos to quotient
         self.pe[:, 0::2] = torch.sin(inner_term)
         self.pe[:, 1::2] = torch.cos(inner_term)
+    
+    def change_device(self, 
+                      device: torch.device,) -> None:
+        '''
+        Ensures that all tensors are properly updated upon device change
+        
+        Params:
+        device is the new torch.device object, generally cuda or cpu
+        '''
+        self.to(device)
+        self.pe = self.pe.to(device)
     
     def forward(self, 
                 x: torch.Tensor,) -> torch.Tensor:
@@ -93,10 +104,10 @@ class ResidualConnection(nn.Module):
         epsilon = 1e-5
         mean = torch.mean(x, dim=-1).unsqueeze(1)
         # Variance = std^2
-        var = torch.mean(torch.square(x - mean))
+        var = torch.mean(torch.square(x - mean.unsqueeze(-1)))
         # Epsilon term prevents div-by-zero
         std = torch.sqrt(var + epsilon)
         
-        norm = (x - mean) / std
+        norm = (x - mean.unsqueeze(-1)) / std
         # Learnable weight/bias are applied
         return self.gamma * norm + self.beta

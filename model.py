@@ -50,13 +50,15 @@ class SelfAttention(nn.Module):
     '''
     def __init__(self, 
                  d_embedding: int, 
-                 n_heads: int,) -> None:
+                 n_heads: int,
+                 max_len: int = 0,) -> None:
         '''
         Initializes an instance of SelfAttention
         
         Params:
         d_embedding is the embedding dimensions for each token
         n_heads is the number of attention heads, which are concatenated after computation
+        max_len is the largest sequence length to be handled
         '''
         super().__init__()
         assert d_embedding % n_heads == 0, 'd_embedding is not divisible by n_heads'
@@ -72,10 +74,21 @@ class SelfAttention(nn.Module):
         self.value = weight()
         self.out_proj = weight()
         
-        self.causal_mask = lambda length: torch.triu(torch.full((length, length), -torch.inf), diagonal=1).unsqueeze(0)
+        self.causal_mask = torch.triu(torch.full((max_len, max_len), -torch.inf), diagonal=1).unsqueeze(0)
         self.d_embedding = d_embedding
         self.n_heads = n_heads
         self.d_k = d_embedding // n_heads
+    
+    def change_device(self, 
+                      device: torch.device,) -> None:
+        '''
+        Ensures that all tensors are properly updated upon device change
+        
+        Params:
+        device is the new torch.device object, generally cuda or cpu
+        '''
+        self.to(device)
+        self.causal_mask = self.causal_mask.to(device)
     
     def forward(self, 
                 x: torch.Tensor, 
@@ -89,7 +102,7 @@ class SelfAttention(nn.Module):
         '''
         # Apply an optional (decoder-only causal mask to hide future tokens)
         length = x.size(-2)
-        mask = self.causal_mask(length) if use_mask else 0
+        mask = self.causal_mask[:length, :length].to(self.causal_mask.device) if use_mask else 0
         
         # Using tuned qkv weights, derive the Q/K/V matrices (shape: [batch, n_heads, length, d_k])
         Q = (x @ self.query.transpose(-2, -1)).view(-1, length, self.n_heads, self.d_k).transpose(-2, -1)
@@ -109,13 +122,14 @@ class CrossAttention(nn.Module):
     '''
     def __init__(self, 
                  d_embedding: int, 
-                 n_heads: int,) -> None:
+                 n_heads: int) -> None:
         '''
         Initializes an instance of CrossAttention
         
         Params:
         d_embedding is the embedding dimensions for each token
         n_heads is the number of attention heads, which are concatenated after computation
+        max_len is the largest sequence length to be handled
         '''
         super().__init__()
         assert d_embedding % n_heads == 0
@@ -131,7 +145,6 @@ class CrossAttention(nn.Module):
         self.value = weight()
         self.out_proj = weight()
         
-        self.causal_mask = lambda length: torch.triu(torch.full((length, length), -torch.inf), diagonal=1).unsqueeze(0)
         self.d_embedding = d_embedding
         self.n_heads = n_heads
         self.d_k = d_embedding // n_heads
@@ -170,7 +183,7 @@ class Encoder(nn.Module):
     '''
     Runs once for a sequence; generates a context-rich vector of the prompt/equivalent
     '''
-    def __init__(self, 
+    def __init__(self,
                  d_embedding: int,
                  max_len: int = 128,
                  n_heads: int = 8,
@@ -202,6 +215,21 @@ class Encoder(nn.Module):
         self.res1 = ResidualConnection(d_embedding=d_embedding)
         self.res2 = ResidualConnection(d_embedding=d_embedding)
     
+    def change_device(self, 
+                      device: torch.device,) -> None:
+        '''
+        Ensures that all tensors are properly updated upon device change
+        
+        Params:
+        device is the new torch.device object, generally cuda or cpu
+        '''
+        self.to(device)
+        self.pe.change_device(device)
+        self.att.change_device(device)
+        self.ffn.to(device)
+        self.res1.to(device)
+        self.res2.to(device)
+    
     def forward(self,
                 x: torch.Tensor,) -> torch.Tensor:
         '''
@@ -223,7 +251,7 @@ class Decoder(nn.Module):
     '''
     Runs until <EOS> token is generated; utilizes context-rich encoded vector and previous tokens to generate new tokens
     '''
-    def __init__(self, 
+    def __init__(self,
                  d_embedding: int,
                  max_len: int = 64,
                  vocab_size: int = 30000,
@@ -250,7 +278,8 @@ class Decoder(nn.Module):
                                      d_embedding=d_embedding,)
         # Attention layers
         self.att1 = SelfAttention(d_embedding=d_embedding,
-                                 n_heads=n_heads,)
+                                 n_heads=n_heads,
+                                 max_len=max_len,)
         self.att2 = CrossAttention(d_embedding=d_embedding,
                                  n_heads=n_heads,)
         # FFN
@@ -262,6 +291,23 @@ class Decoder(nn.Module):
         self.res3 = ResidualConnection(d_embedding=d_embedding)
         # Final transformation
         self.lin = nn.Linear(d_embedding, vocab_size)
+
+    def change_device(self, 
+                      device: torch.device,) -> None:
+        '''
+        Ensures that all tensors are properly updated upon device change
+        
+        Params:
+        device is the new torch.device object, generally cuda or cpu
+        '''
+        self.to(device)
+        self.pe.change_device(device)
+        self.att1.change_device(device)
+        self.att2.to(device)
+        self.ffn.to(device)
+        self.res1.to(device)
+        self.res2.to(device)
+        self.res3.to(device)
 
     def forward(self,
                 x: torch.Tensor,
@@ -293,24 +339,64 @@ class Transformer(nn.Module):
     A transformer neural network, encodes a prompt and autoregressively generates tokens using attention until <EOS> is reached
     '''
     def __init__(self,
-                 encoder: Encoder,
-                 decoder: Decoder,) -> None:
+                 device: torch.device,
+                 d_embedding: int,
+                 encoder_max_len: int = 128,
+                 decoder_max_len: int = 64,
+                 n_heads: int = 8,
+                 layers: int = 6,) -> None:
         '''
         Initializes an instance of Transformer
         
         Params:
+        device is the training device, cuda or cpu
         d_embedding is the embedding dimensions for each token
+        encoder_max_len is the largest prompt length to be handled
+        decoder_max_len is the largest response length to be handled
+        vocab_size is the size the list containing possible tokens to generate
+        n_heads is the number of attention heads, which are concatenated after computation
+        layers is the number of repetitions done by the central block
+        max_len is the largest sequence length to be handled
         '''
         super().__init__()
-        # Extract embedding dimensions and vocab size from enc/dec
-        assert encoder.d_embedding == decoder.d_embedding
-        self.d_embedding = encoder.d_embedding
-        self.vocab_size = decoder.vocab_size
         
-        self.enc = encoder
-        self.dec = decoder
+        # Embedding/tokenizing models
         self.tokenizer = AutoTokenizer.from_pretrained('facebook/bart-base')
-        self.embedding = nn.Embedding(num_embeddings=self.vocab_size, embedding_dim=self.d_embedding)
+        self.vocab_size = self.tokenizer.vocab_size
+        self.embedding = nn.Embedding(num_embeddings=self.vocab_size, embedding_dim=d_embedding).to(device)
+        
+        self.d_embedding = d_embedding
+        # P.E. hyperparams
+        self.enc_len = encoder_max_len
+        self.dec_len = decoder_max_len
+        # Main model hyperparams
+        self.heads = n_heads
+        self.layers = layers
+        # Enc/dec objects
+        self.enc = Encoder(d_embedding=d_embedding,
+                           max_len=encoder_max_len,
+                           n_heads=n_heads,
+                           layers=layers,)
+        self.dec = Decoder(d_embedding=d_embedding,
+                           max_len=decoder_max_len,
+                           vocab_size=self.vocab_size,
+                           n_heads=n_heads,
+                           layers=layers,)
+        self.change_device(device)
+        
+    def change_device(self, 
+                      device: torch.device,) -> None:
+        '''
+        Ensures that all tensors are properly updated upon device change
+        
+        Params:
+        device is the new torch.device object, generally cuda or cpu
+        '''
+        self.device = device
+        self.to(device)
+        self.embedding.to(device)
+        self.enc.change_device(device)
+        self.dec.change_device(device)
     
     def embed(self,
               tokens: torch.Tensor,) -> torch.Tensor:
@@ -337,9 +423,9 @@ class Transformer(nn.Module):
         inference determines whether strings or gradient-ready softmax probabilities are returned
         '''
         # Tokenize
-        tokens = self.tokenizer(x.lower(), max_length=self.enc.max_len, return_tensors='pt', truncation=True, padding=True)
+        tokens = self.tokenizer(x, max_length=self.enc.max_len, return_tensors='pt', truncation=True, padding=True)
         # Get context vector from encoder
-        x = self.embed(tokens=tokens['input_ids'])
+        x = self.embed(tokens=tokens['input_ids'].to(self.device))
         context = self.enc(x)
         
         # ids are converted to a string, embedded_ids are fed back into the model
