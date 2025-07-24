@@ -74,7 +74,7 @@ class SelfAttention(nn.Module):
         self.value = weight()
         self.out_proj = weight()
         
-        self.causal_mask = torch.triu(torch.full((max_len, max_len), -torch.inf), diagonal=1).unsqueeze(0)
+        self.causal_mask = torch.triu(torch.full((1, n_heads, max_len, max_len), -torch.inf), diagonal=1)
         self.d_embedding = d_embedding
         self.n_heads = n_heads
         self.d_k = d_embedding // n_heads
@@ -102,13 +102,15 @@ class SelfAttention(nn.Module):
         '''
         # Apply an optional (decoder-only causal mask to hide future tokens)
         length = x.size(-2)
-        mask = self.causal_mask[:length, :length].to(self.causal_mask.device) if use_mask else 0
+        mask = self.causal_mask[:, :, :length, :length].to(self.causal_mask.device) if use_mask else 0
         # Using tuned qkv weights, derive the Q/K/V matrices (shape: [batch, n_heads, length, d_k])
         Q = (x @ self.query.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1)
         K = (x @ self.key.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1)
         V = (x @ self.value.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1)
         qk_dot = (Q @ K.transpose(-2, -1)) / np.sqrt(self.d_k) # shape: [batch, n_heads, length, length]
-        print(qk_dot.shape, Q.shape, K.shape, V.shape)
+        '''print(x.shape, qk_dot.shape, Q.shape, K.shape, V.shape)
+        if use_mask:
+            print('ms', mask.shape, self.causal_mask.shape)'''
         valued_weights = torch.softmax(qk_dot + mask, dim=-1) @ V # shape: [batch, n_heads, length, d_k]
         concat_heads = valued_weights.transpose(-2, -1).contiguous().view(-1, length, self.d_embedding) # shape: [batch, length, embedding_dim]
         
@@ -135,19 +137,20 @@ class CrossAttention(nn.Module):
         assert d_embedding % n_heads == 0
         
         # Sample weights from identical distribution
-        weight = lambda: nn.Parameter(
-            torch.empty(d_embedding, d_embedding).uniform_(
+        weight = lambda *shape: nn.Parameter(
+            torch.empty(*shape).uniform_(
                 -np.sqrt(3 / d_embedding), 
                 np.sqrt(3 / d_embedding))
         )
-        self.query = weight()
-        self.key = weight()
-        self.value = weight()
-        self.out_proj = weight()
         
         self.d_embedding = d_embedding
         self.n_heads = n_heads
         self.d_k = d_embedding // n_heads
+        
+        self.query = weight(d_embedding, d_embedding)
+        self.key = weight(d_embedding, d_embedding)
+        self.value = weight(d_embedding, d_embedding)
+        self.out_proj = weight(d_embedding, d_embedding)
     
     def forward(self, 
                 x: torch.Tensor, 
@@ -159,19 +162,19 @@ class CrossAttention(nn.Module):
         X is the positionally-encoded or dense-layer embeddings of shape [batch, dec_length, embedding_dim]
         context is the context-rich embeddings from the encoder to be attended of shape [batch, enc_length, embedding_dim]
         '''
-        length = x.size(-2)
-        
+        dec_length = x.size(-2)
+        enc_length = context.size(-2)
         # Using tuned qkv weights, derive the Q/K/V matrices
-        Q = (x @ self.query.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1) # shape: [batch, n_heads, dec_length, d_k]
-        K = (context @ self.key.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1) # shape: [batch, n_heads, enc_length, d_k]
-        V = (context @ self.value.transpose(-2, -1)).view(-1, self.n_heads, length, self.d_k).transpose(-2, -1) #shape: [batch, n_heads, enc_length, d_k]
+        Q = (x @ self.query.transpose(-2, -1)).view(-1, dec_length, self.n_heads, self.d_k).transpose(-3, -2) # shape: [batch, n_heads, dec_length, d_k]
+        K = (context @ self.key.transpose(-2, -1)).view(-1, enc_length, self.n_heads, self.d_k).transpose(-3, -2) # shape: [batch, n_heads, enc_length, d_k]
+        V = (context @ self.value.transpose(-2, -1)).view(-1, enc_length, self.n_heads, self.d_k).transpose(-3, -2) # shape: [batch, n_heads, enc_length, d_k]
         
         qk_dot = (Q @ K.transpose(-2, -1)) / np.sqrt(self.d_k) # shape: [batch, n_heads, dec_length, enc_length]
         valued_weights = torch.softmax(qk_dot, dim=-1) @ V # shape: [batch, n_heads, dec_length, d_k]
-        concat_heads = valued_weights.transpose(-2, -1).contiguous().view(-1, length, self.d_embedding) # shape: [batch, dec_length, embedding_dim]
+        concat_heads = valued_weights.transpose(-2, -1).contiguous().view(-1, dec_length, self.d_embedding) # shape: [batch, dec_length, embedding_dim]
         
         # Linear projection applied to concatenated heads
-        return concat_heads @ self.out_proj.transpose(-2, -1) # shape: [batch, length, embedding_dim]
+        return concat_heads @ self.out_proj.transpose(-2, -1) # shape: [batch, dec_length, embedding_dim]
     
     
 # ---------------------------
@@ -320,7 +323,6 @@ class Decoder(nn.Module):
         context is the context-rich embeddings from the encoder to be attended of shape [batch, enc_length, embedding_dim]
         temperature < 0 scales the "unpredictability" of the output, where T > 1 produces less predictable tokens, and T < 1 produces more predictable tokens
         '''
-        print('1')
         x = self.pe(x)
         # Main decoder block
         for _ in range(self.layers):
@@ -331,7 +333,7 @@ class Decoder(nn.Module):
             x = self.res3(self.ffn(x))
         # Projection to probability distribution
         x = self.lin(x) / temperature
-        return torch.softmax(x, dim=1)[-1]
+        return torch.softmax(x, dim=-1)[:, -1, :]
     
 
 class Transformer(nn.Module):
@@ -426,14 +428,12 @@ class Transformer(nn.Module):
         tokens = self.tokenizer(x, max_length=self.enc.max_len, return_tensors='pt', truncation=True, padding=True)
         # Get context vector from encoder
         x = self.embed(tokens=tokens['input_ids'].to(self.device))
-        print(x.shape)
         context = self.enc(x)
-        print(context.shape)
         
         # ids are converted to a string, embedded_ids are fed back into the model
-        ids = torch.Tensor(torch.zeros(x.size(0)) if x.size(0) > 1 else [0]).int().to(self.device) # Handle batches vs. single-prompt inference
+        ids = torch.zeros(x.size(0), 1).int().to(self.device)
         embedded_ids = self.embed(ids)
-        probs = torch.Tensor()
+        probs = torch.Tensor().to(self.device)
         
         # Autoregressively run the decoder until an EOS is produced (id=2)
         while self.tokenizer.decode(ids[-1]) != 2 and ids.size(0) < self.dec.max_len:
@@ -442,7 +442,8 @@ class Transformer(nn.Module):
             # Softmax probabilities
             probs = torch.cat([probs, self.dec(embedded_ids, context=context, temperature=temperature)])
             # Sampled IDs
-            ids = torch.cat([ids, torch.multinomial(probs[-1], num_samples=1, replacement=False)])
+            print(torch.multinomial(probs, num_samples=1, replacement=False).shape, ids.shape)
+            ids = torch.cat([ids, torch.multinomial(probs, num_samples=1, replacement=False)])
             
         # Convert ids to string for easy inference, else return raw ids
         if inference:
